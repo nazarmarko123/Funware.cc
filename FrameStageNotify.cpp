@@ -1,0 +1,679 @@
+#include "hooks.h"
+#include "global.h"
+#include "Menu.h"
+#include "BacktrackingHelper.h"
+#include "xor.h"
+#include <intrin.h>
+#include "SpoofedConvar.h"
+#include "Math.h"
+#include "Skinchanger/NewSkinchanger.h"
+#include "Skinchanger/GloveChanger.h"
+#include "Items.h"
+#include "Resolver2.h"
+#include <deque>
+
+#define INVALID_EHANDLE_INDEX 0xFFFFFFFF
+
+#define TICK_INTERVAL (g_pGlobals->interval_per_tick)
+#define TIME_TO_TICKS(dt) ((int)(0.5f + (float)(dt) / TICK_INTERVAL))
+#define TICKS_TO_TIME(t) (TICK_INTERVAL * (t))
+
+ConVar* mp_facefronttime;
+ConVar* r_DrawSpecificStaticProp;
+
+DWORD eyeangles;
+int Shots;
+
+
+struct STickRecord
+{
+	void SaveRecord(CBaseEntity *player)
+	{
+		m_flLowerBodyYawTarget = player->LowerBodyYaw();;
+		m_angEyeAngles = player->GetEyeAngles();
+		m_flSimulationTime = player->GetSimulationTime();
+		m_flPoseParameter = player->m_flPoseParameter();
+		m_flCurTime = g_pGlobals->curtime;
+		m_nFlags = *player->GetFlags();
+		m_flVelocity = player->Velocity().Length2D();
+		m_vecVelocity = player->Velocity();
+
+		m_iLayerCount = player->GetNumAnimOverlays();
+		for (int i = 0; i < m_iLayerCount; i++)
+			animationLayer[i] = player->GetAnimOverlays()[i];
+	}
+
+	bool operator==(STickRecord &other)
+	{
+		return other.m_flSimulationTime == m_flSimulationTime;
+	}
+	int tickcount = 0;
+	float m_flVelocity = 0.f;
+	Vector m_vecVelocity = Vector(0, 0, 0);
+	float m_flSimulationTime = 0.f;
+	float m_flLowerBodyYawTarget = 0.f;
+	Vector m_angEyeAngles = Vector(0, 0, 0);
+	std::array<float, 24> m_flPoseParameter = {};
+	float m_flCurTime = 0.f;
+	int m_nFlags = 0;
+
+	int m_iLayerCount = 0;
+	AnimationLayer animationLayer[15];
+};
+
+
+struct SResolveInfo
+{
+	std::deque<STickRecord> arr_tickRecords;
+
+	STickRecord curTickRecord;
+	STickRecord prevTickRecord;
+
+	float m_flLastLbyTime = 0.f;
+
+	Vector m_angDirectionFirstMoving = Vector(0, 0, 0);
+};
+
+bool IsAdjustingBalance(CBaseEntity *player, STickRecord &record, AnimationLayer *layer)
+{
+	for (int i = 0; i < record.m_iLayerCount; i++)
+	{
+		const int activity = player->GetSequenceActivity(record.animationLayer[i].m_nSequence);
+		if (activity == 979)
+		{
+			*layer = record.animationLayer[i];
+			return true;
+		}
+	}
+	return false;
+}
+
+
+int get_model_index(int item_def_index)
+{
+	int ret = 0;
+	switch (item_def_index) {
+	case KNIFE:
+		ret = g_pModelInfo->GetModelIndex(XorStr("models/weapons/v_knife_default_ct.mdl"));
+		break;
+	case KNIFE_T:
+		ret = g_pModelInfo->GetModelIndex(XorStr("models/weapons/v_knife_default_t.mdl"));
+		break;
+	case KNIFE_KARAMBIT:
+		ret = g_pModelInfo->GetModelIndex(XorStr("models/weapons/v_knife_karam.mdl"));
+		break;
+	case KNIFE_BAYONET:
+		ret = g_pModelInfo->GetModelIndex(XorStr("models/weapons/v_knife_bayonet.mdl"));
+		break;
+	case KNIFE_M9_BAYONET:
+		ret = g_pModelInfo->GetModelIndex(XorStr("models/weapons/v_knife_m9_bay.mdl"));
+		break;
+	case KNIFE_TACTICAL:
+		ret = g_pModelInfo->GetModelIndex(XorStr("models/weapons/v_knife_tactical.mdl"));
+		break;
+	case KNIFE_GUT:
+		ret = g_pModelInfo->GetModelIndex(XorStr("models/weapons/v_knife_gut.mdl"));
+		break;
+	case KNIFE_FALCHION:
+		ret = g_pModelInfo->GetModelIndex(XorStr("models/weapons/v_knife_falchion_advanced.mdl"));
+		break;
+	case KNIFE_PUSH:
+		ret = g_pModelInfo->GetModelIndex(XorStr("models/weapons/v_knife_push.mdl"));
+		break;
+	case KNIFE_BUTTERFLY:
+		ret = g_pModelInfo->GetModelIndex(XorStr("models/weapons/v_knife_butterfly.mdl"));
+		break;
+	case KNIFE_FLIP:
+		ret = g_pModelInfo->GetModelIndex(XorStr("models/weapons/v_knife_flip.mdl"));
+		break;
+	case KNIFE_BOWIE:
+		ret = g_pModelInfo->GetModelIndex(XorStr("models/weapons/v_knife_survival_bowie.mdl"));
+		break;
+	default:
+		break;
+	}
+	return ret;
+}
+
+std::vector<const char*> vistasmoke_mats = {
+	"particle/vistasmokev1/vistasmokev1_fire",
+	"particle/vistasmokev1/vistasmokev1_smokegrenade",
+	"particle/vistasmokev1/vistasmokev1_emods",
+	"particle/vistasmokev1/vistasmokev1_emods_impactdust",
+};
+
+std::vector<const char*> smoke_materials = {
+	"particle/beam_smoke_01",
+	"particle/particle_smokegrenade",
+	"particle/particle_smokegrenade1",
+	"particle/particle_smokegrenade2",
+	"particle/particle_smokegrenade3",
+	"particle/particle_smokegrenade_sc",
+	"particle/smoke1/smoke1",
+	"particle/smoke1/smoke1_ash",
+	"particle/smoke1/smoke1_nearcull",
+	"particle/smoke1/smoke1_nearcull2",
+	"particle/smoke1/smoke1_snow",
+	"particle/smokesprites_0001",
+	"particle/smokestack",
+	"particle/vistasmokev1/vistasmokev1",
+	"particle/vistasmokev1/vistasmokev1_emods",
+	"particle/vistasmokev1/vistasmokev1_emods_impactdust",
+	"particle/vistasmokev1/vistasmokev1_fire",
+	"particle/vistasmokev1/vistasmokev1_nearcull",
+	"particle/vistasmokev1/vistasmokev1_nearcull_fog",
+	"particle/vistasmokev1/vistasmokev1_nearcull_nodepth",
+	"particle/vistasmokev1/vistasmokev1_smokegrenade",
+	"particle/vistasmokev1/vistasmokev4_emods_nocull",
+	"particle/vistasmokev1/vistasmokev4_nearcull",
+	"particle/vistasmokev1/vistasmokev4_nocull"
+};
+
+
+
+bool lowerBodyYawUpdated(CBaseEntity* pEntity)
+{
+	for (int w = 0; w < 13; w++) {
+		AnimationLayer currentLayer = pEntity->GetAnimOverlay(w);
+		const int activity = pEntity->GetSequenceActivity(currentLayer.m_nSequence);
+		float flcycle = currentLayer.m_flCycle, flprevcycle = currentLayer.m_flPrevCycle, flweight = currentLayer.m_flWeight, flweightdatarate = currentLayer.m_flWeightDeltaRate;
+		uint32_t norder = currentLayer.m_nOrder;
+		if (activity == 973 && flweight == 1.f || activity == 979 && flweight == 1.0f && currentLayer.m_flPrevCycle != currentLayer.m_flCycle)
+
+			return true;
+	}
+	return false;
+}
+
+bool BreakingMoreThan120(CBaseEntity* pEntity)
+{
+	for (int w = 0; w < 13; w++) {
+		AnimationLayer prevlayer;
+		AnimationLayer currentLayer = pEntity->GetAnimOverlay(w);
+		const int activity = pEntity->GetSequenceActivity(currentLayer.m_nSequence);
+		float flcycle = currentLayer.m_flCycle, flprevcycle = currentLayer.m_flPrevCycle, flweight = currentLayer.m_flWeight, flweightdatarate = currentLayer.m_flWeightDeltaRate;
+		uint32_t norder = currentLayer.m_nOrder;
+		if (activity == ACT_CSGO_IDLE_ADJUST_STOPPEDMOVING || activity == ACT_CSGO_IDLE_TURN_BALANCEADJUST && flweight >= .99 && currentLayer.m_flPrevCycle != currentLayer.m_flCycle) {
+			float flanimTime = currentLayer.m_flCycle, flsimtime = pEntity->GetSimulationTime();
+
+			return true;
+		}
+		prevlayer = currentLayer;
+		return false;
+	}
+	return false;
+}
+
+bool Under120(CBaseEntity* pEntity)
+{
+	for (int w = 0; w < 13; w++) {
+		AnimationLayer prevlayer;
+		AnimationLayer currentLayer = pEntity->GetAnimOverlay(w);
+		const int activity = pEntity->GetSequenceActivity(currentLayer.m_nSequence);
+		float flcycle = currentLayer.m_flCycle, flprevcycle = currentLayer.m_flPrevCycle, flweight = currentLayer.m_flWeight, flweightdatarate = currentLayer.m_flWeightDeltaRate;
+		uint32_t norder = currentLayer.m_nOrder;
+		if (activity == 979 && currentLayer.m_flWeight == 0.f && currentLayer.m_flPrevCycle != currentLayer.m_flCycle) {
+			return true;
+		}
+		prevlayer = currentLayer;
+	}
+	return false;
+}
+
+bool playerStoppedMoving(CBaseEntity* pEntity)
+{
+	for (int w = 0; w < 13; w++) {
+		AnimationLayer currentLayer = pEntity->GetAnimOverlay(w);
+		const int activity = pEntity->GetSequenceActivity(currentLayer.m_nSequence);
+		float flcycle = currentLayer.m_flCycle, flprevcycle = currentLayer.m_flPrevCycle, flweight = currentLayer.m_flWeight, flweightdatarate = currentLayer.m_flWeightDeltaRate;
+		uint32_t norder = currentLayer.m_nOrder;
+		if (activity == ACT_CSGO_IDLE_ADJUST_STOPPEDMOVING)
+			return true;
+	}
+	return false;
+}
+
+bool lastLbyupdate(CBaseEntity* pEntity)
+{
+	static float prediction = 0.f;
+	static bool secondrun = false;
+	float flServerTime = (float)pEntity->GetTickBase() * g_pGlobals->interval_per_tick;
+	if (playerStoppedMoving(pEntity) && !secondrun) {
+		prediction = flServerTime + 0.22;
+		secondrun = true;
+	}
+	else if (pEntity->GetVelocity().Length2D() < 0.1f && secondrun && prediction <= pEntity->GetSimulationTime()) {
+		prediction = pEntity->GetTickBase() + 1.1f;
+	}
+	else {
+		secondrun = false;
+		return false;
+	}
+	if (prediction <= pEntity->GetSimulationTime()) {
+		return true;
+	}
+	return false;
+}
+
+
+bool IsOnAir(CBaseEntity* pEntity)
+{
+	if (!pEntity->GetFlags() & FL_ONGROUND) {
+		return true;
+	}
+	return false;
+}
+
+enum {
+	TE_SPRITE = 0x01,
+	TE_BEAMDISK = 0x02,
+	TE_BEAMCYLINDER = 0x03,
+	TE_BEAMFOLLOW = 0x04,
+	TE_BEAMRING = 0x05,
+	TE_BEAMSPLINE = 0x06,
+	TE_BEAMRINGPOINT = 0x07,
+	TE_BEAMLASER = 0x08,
+	TE_BEAMTESLA = 0x09,
+};
+
+enum {
+	FBEAM_STARTENTITY = 0x00000001,
+	FBEAM_ENDENTITY = 0x00000002,
+	FBEAM_FADEIN = 0x00000004,
+	FBEAM_FADEOUT = 0x00000008,
+	FBEAM_SINENOISE = 0x00000010,
+	FBEAM_SOLID = 0x00000020,
+	FBEAM_SHADEIN = 0x00000040,
+	FBEAM_SHADEOUT = 0x00000080,
+	FBEAM_ONLYNOISEONCE = 0x00000100,
+	FBEAM_NOTILE = 0x00000200,
+	FBEAM_USE_HITBOXES = 0x00000400,
+	FBEAM_STARTVISIBLE = 0x00000800,
+	FBEAM_ENDVISIBLE = 0x00001000,
+	FBEAM_ISACTIVE = 0x00002000,
+	FBEAM_FOREVER = 0x00004000,
+	FBEAM_HALOBEAM = 0x00008000,
+	FBEAM_REVERSED = 0x00010000,
+	NUM_BEAM_FLAGS = 17
+};
+
+void DrawBeam(Vector src, Vector end, Color color)
+{
+	BeamInfo_t beamInfo;
+	beamInfo.m_nType = TE_BEAMPOINTS;
+	beamInfo.m_pszModelName = "sprites/purplelaser1.vmt";
+	beamInfo.m_nModelIndex = -1;
+	beamInfo.m_flHaloScale = 2.0f;
+	beamInfo.m_flLife = 1.0f;
+	beamInfo.m_flWidth = 3.8f;
+	beamInfo.m_flEndWidth = 3.8f;
+	beamInfo.m_flFadeLength = 0.2f;
+	beamInfo.m_flAmplitude = 2.0f;
+	beamInfo.m_flBrightness = 255.f;
+	beamInfo.m_flSpeed = 0.2f;
+	beamInfo.m_nStartFrame = 0;
+	beamInfo.m_flFrameRate = 0.f;
+	beamInfo.m_flRed = color.r();
+	beamInfo.m_flGreen = color.g();
+	beamInfo.m_flBlue = color.b();
+	beamInfo.m_nSegments = 2;
+	beamInfo.m_bRenderable = true;
+	beamInfo.m_nFlags = 0;
+
+	beamInfo.m_vecStart = src;
+	beamInfo.m_vecEnd = end;
+
+	Beam_t* myBeam = g_pViewRenderBeams->CreateBeamPoints(beamInfo);
+
+	if (myBeam)
+		g_pViewRenderBeams->DrawBeam(myBeam);
+}
+struct ResolverData
+{
+	float simtime, flcycle[13], flprevcycle[13], flweight[13], flweightdatarate[13], fakewalkdetection[2], fakeanglesimtimedetection[2], fakewalkdetectionsimtime[2];
+	float yaw, addyaw, lbycurtime;
+	float shotsimtime, oldlby, lastmovinglby, balanceadjustsimtime, balanceadjustflcycle;
+	int fakeanglesimtickdetectionaverage[4], amountgreaterthan2, amountequal1or2, amountequal0or1, amountequal1, amountequal0, resetmovetick, resetmovetick2;
+	int tick, balanceadjusttick, missedshots, activity[13];
+	bool bfakeangle, bfakewalk, playerhurtcalled, weaponfirecalled;
+	Vector shotaimangles, hitboxPos, balanceadjustaimangles;
+	uint32_t norder[13];
+	char* resolvermode = "NONE", *fakewalk = "Not Moving";
+} pResolverData[64];;
+
+void __stdcall Hooks::FrameStageNotify(ClientFrameStage_t curStage)
+{
+	if (g_pEngine->IsConnected() && g_pEngine->IsInGame())
+	{
+		static std::string old_Skyname = XorStr("");
+		static bool OldNightmode;
+		static int OldSky;
+
+		if (!G::LocalPlayer || !g_pEngine->IsConnected() || !g_pEngine->IsInGame()) {
+			clientVMT->GetOriginalMethod<FrameStageNotifyFn>(37)(curStage);
+			old_Skyname = XorStr("");
+			OldNightmode = false;
+			OldSky = 0;
+			return;
+		}
+
+		if (OldNightmode != Clientvariables->Visuals.nightmode) {
+
+			if (!r_DrawSpecificStaticProp)
+				r_DrawSpecificStaticProp = g_pCvar->FindVar(XorStr("r_DrawSpecificStaticProp"));
+
+			r_DrawSpecificStaticProp->SetValue(0);
+
+			for (MaterialHandle_t i = g_pMaterialSystem->FirstMaterial(); i != g_pMaterialSystem->InvalidMaterial(); i = g_pMaterialSystem->NextMaterial(i)) {
+				IMaterial* pMaterial = g_pMaterialSystem->GetMaterial(i);
+
+				if (!pMaterial)
+					continue;
+
+				if (strstr(pMaterial->GetTextureGroupName(), XorStr("World")) || strstr(pMaterial->GetTextureGroupName(), XorStr("StaticProp"))) {
+					if (Clientvariables->Visuals.nightmode)
+						if (strstr(pMaterial->GetTextureGroupName(), XorStr("StaticProp")))
+							pMaterial->ColorModulate(0.3f, 0.3f, 0.3f);
+						else
+							pMaterial->ColorModulate(0.05f, 0.05f, 0.05f);
+					else
+						pMaterial->ColorModulate(1.0f, 1.0f, 1.0f);
+				}
+			}
+			OldNightmode = Clientvariables->Visuals.nightmode;
+		}
+
+		if (OldSky != Clientvariables->Visuals.Skybox) {
+			auto LoadNamedSky = reinterpret_cast<void(__fastcall*)(const char*)>(FindPatternIDA(XorStr("engine.dll"), XorStr("55 8B EC 81 EC ? ? ? ? 56 57 8B F9 C7 45")));
+			if (old_Skyname == XorStr("")) {
+
+			}
+
+			int type = Clientvariables->Visuals.Skybox;
+
+			if (type == 1)
+				LoadNamedSky(XorStr("cs_baggage_skybox_"));
+			else if (type == 2)
+				LoadNamedSky(XorStr("cs_tibet"));
+			else if (type == 3)
+				LoadNamedSky(XorStr("italy"));
+			else if (type == 4)
+				LoadNamedSky(XorStr("jungle"));
+			else if (type == 5)
+				LoadNamedSky(XorStr("office"));
+			else if (type == 6)
+				LoadNamedSky(XorStr("sky_cs15_daylight02_hdr"));
+			else if (type == 7)
+				LoadNamedSky(XorStr("sky_csgo_night02"));
+			else if (type == 8)
+				LoadNamedSky(XorStr("vertigo"));
+
+			OldSky = Clientvariables->Visuals.Skybox;
+		}
+
+		static bool TransparensWalls = false;
+		if (TransparensWalls != Clientvariables->Visuals.TransparensWallsEnable && g_pEngine->IsConnected() && g_pEngine->IsInGame()) {
+
+			if (!r_DrawSpecificStaticProp)
+				r_DrawSpecificStaticProp = g_pCvar->FindVar(XorStr("r_DrawSpecificStaticProp"));
+
+			r_DrawSpecificStaticProp->SetValue(0);
+
+			for (MaterialHandle_t i = g_pMaterialSystem->FirstMaterial(); i != g_pMaterialSystem->InvalidMaterial(); i = g_pMaterialSystem->NextMaterial(i)) {
+				IMaterial* pMaterial = g_pMaterialSystem->GetMaterial(i);
+
+				if (!pMaterial)
+					continue;
+
+				if (strstr(pMaterial->GetTextureGroupName(), XorStr("StaticProp"))) {
+					pMaterial->AlphaModulate(0.35f);
+				}
+			}
+			TransparensWalls = Clientvariables->Visuals.TransparensWallsEnable;
+		}
+
+		static Vector oldViewPunch;
+		static Vector oldAimPunch;
+
+		Vector* view_punch = G::LocalPlayer->GetViewPunchPtr();
+		Vector* aim_punch = G::LocalPlayer->GetPunchAnglePtr();
+
+		if (curStage == FRAME_RENDER_START && G::LocalPlayer->GetHealth() > 0) {
+			static bool enabledtp = false, check = false;
+
+			if (GetAsyncKeyState(Clientvariables->Misc.TPKey)) {
+				if (!check)
+					enabledtp = !enabledtp;
+				check = true;
+			}
+			else
+				check = false;
+
+			if (enabledtp) {
+				*reinterpret_cast<QAngle*>(reinterpret_cast<DWORD>(G::LocalPlayer + 0x31C0 + 0x8)) = G::AAAngle;
+			}
+
+			if (view_punch && aim_punch && Clientvariables->Visuals.Novisrevoil) {
+				oldViewPunch = *view_punch;
+				oldAimPunch = *aim_punch;
+
+				view_punch->Init();
+				aim_punch->Init();
+			}
+
+			if (enabledtp && G::LocalPlayer->isAlive()) {
+				*(bool*)((DWORD)g_pInput + 0xA5) = true;
+				*(float*)((DWORD)g_pInput + 0xA8 + 0x8) = 150;
+			}
+			else {
+				*(bool*)((DWORD)g_pInput + 0xA5) = false;
+				*(float*)((DWORD)g_pInput + 0xA8 + 0x8);
+			}
+		}
+
+		if (curStage == FRAME_NET_UPDATE_START) {
+			if (Clientvariables->Visuals.BulletTracers) {
+				float Red, Green, Blue;
+
+				Red = Clientvariables->Colors.Bulletracer[0] * 255;
+				Green = Clientvariables->Colors.Bulletracer[1] * 255;
+				Blue = Clientvariables->Colors.Bulletracer[2] * 255;
+
+				for (unsigned int i = 0; i < trace_logs.size(); i++) {
+
+					auto* shooter = g_pEntitylist->GetClientEntity(g_pEngine->GetPlayerForUserID(trace_logs[i].userid));
+
+					if (!shooter)
+						return;
+
+					Color color;
+					if (shooter->GetTeamNum() == 3)
+						color = Color(Red, Green, Blue, 255);
+					else
+						color = Color(Red, Green, Blue, 255);
+
+					DrawBeam(trace_logs[i].start, trace_logs[i].position, color);
+
+					trace_logs.erase(trace_logs.begin() + i);
+				}
+			}
+
+			for (auto mat_s : vistasmoke_mats) {
+				IMaterial* mat = g_pMaterialSystem->FindMaterial(mat_s, TEXTURE_GROUP_OTHER);
+				mat->SetMaterialVarFlag(MATERIAL_VAR_WIREFRAME, Clientvariables->Visuals.Nosmoke ? true : false);
+			}
+
+			if (Clientvariables->Visuals.Nosmoke) {
+				static int* smokecount = *(int**)(FindPatternIDA(XorStr("client_panorama.dll"), XorStr("A3 ? ? ? ? 57 8B CB")) + 0x1);
+				*smokecount = 0;
+			}
+
+			for (int i = 1; i < g_pGlobals->maxClients; i++) {
+
+				CBaseEntity* pEntity = g_pEntitylist->GetClientEntity(i);
+				if (pEntity) {
+					if (pEntity->GetHealth() > 0) {
+						if (i != g_pEngine->GetLocalPlayer()) {
+							VarMapping_t* map = pEntity->GetVarMap();
+							if (map) {
+								if (Clientvariables->Ragebot.PositionAdjustment) {
+									map->m_nInterpolatedEntries = 0;
+								}
+								else {
+									if (map->m_nInterpolatedEntries == 0)
+										map->m_nInterpolatedEntries = 6;
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if (curStage == FRAME_RENDER_START) {
+			for (int i = 1; i < g_pGlobals->maxClients; i++) {
+				if (i == g_pEngine->GetLocalPlayer())
+					continue;
+				CBaseEntity* pEntity = g_pEntitylist->GetClientEntity(i);
+				if (pEntity) {
+					if (pEntity->GetHealth() > 0 && !pEntity->IsDormant()) {
+						*(int*)((uintptr_t)pEntity + 0xA30) = g_pGlobals->framecount;
+						*(int*)((uintptr_t)pEntity + 0xA28) = 0;
+					}
+				}
+			}
+		}
+
+		if (curStage == FRAME_NET_UPDATE_POSTDATAUPDATE_START)
+		{
+			newskinchanger();
+			GloveChanger();
+			if (Clientvariables->Ragebot.perfectresolver)
+				set->DoResolver();
+			for (int i = 1; i < g_pGlobals->maxClients; i++)
+			{
+				if (i == g_pEngine->GetLocalPlayer())
+					continue;
+				CBaseEntity* pEntity = g_pEntitylist->GetClientEntity(i);
+
+
+
+
+
+				if (pEntity && pEntity->GetHealth() > 0)
+				{
+					if (pEntity->IsDormant())
+						continue;
+					int index = pEntity->Index();
+
+					if (Clientvariables->Ragebot.AutomaticResolver && G::LocalPlayer->isAlive())
+					{
+						float c_m_flWeight = g_BacktrackHelper->PlayerRecord[i].currentLayer.m_flWeight;
+						float c_m_flCycle = g_BacktrackHelper->PlayerRecord[i].currentLayer.m_flCycle;
+
+						float p_m_flWeight = g_BacktrackHelper->PlayerRecord[i].previous_layer.m_flWeight;
+						float p_m_flCycle = g_BacktrackHelper->PlayerRecord[i].previous_layer.m_flCycle;
+
+						if (G::weaponfirecalled)
+						{
+							if (!G::playerhurtcalled)
+							{
+								pResolverData[i].addyaw += 65.f;
+								Math::NormalizeYaw(pResolverData[i].addyaw);
+							}
+							else
+								G::playerhurtcalled = false;
+							G::weaponfirecalled = false;
+						}
+
+						const int activity = pEntity->GetSequenceActivity(g_BacktrackHelper->PlayerRecord[i].currentLayer.m_nSequence);
+						const int activity2 = pEntity->GetSequenceActivity(g_BacktrackHelper->PlayerRecord[i].previous_layer.m_nSequence);
+
+						Vector* pAngles = pEntity->GetEyeAnglesPtr();
+
+						if (pEntity->GetVelocity().Length2D() > 100)
+						{
+							pResolverData[pEntity->GetIndex()].lastmovinglby = g_BacktrackHelper->PlayerRecord[i].LowerBodyYawTarget;
+							pAngles->y = g_BacktrackHelper->PlayerRecord[i].LowerBodyYawTarget;
+						}
+						else if (pEntity->GetVelocity().Length2D() > 15)
+						{
+
+							pAngles->y = g_BacktrackHelper->PlayerRecord[i].LowerBodyYawTarget;
+						}
+						else
+						{
+							pResolverData[pEntity->GetIndex()].oldlby = g_BacktrackHelper->PlayerRecord[i].LowerBodyYawTarget;
+							if (activity == ACT_CSGO_IDLE_TURN_BALANCEADJUST) {
+								if (activity2 == ACT_CSGO_IDLE_TURN_BALANCEADJUST) {
+									if ((p_m_flCycle != c_m_flCycle) || c_m_flWeight == 1.f)
+									{
+										float
+											flAnimTime = c_m_flCycle,
+											flSimTime = pEntity->GetSimulationTime();
+
+										if (flAnimTime < 0.01f && p_m_flCycle > 0.01f && Clientvariables->Ragebot.PositionAdjustment) // lby flicked here
+										{
+											G::FakeDetection[i] = 1;
+											pAngles->y = pResolverData[pEntity->GetIndex()].lastmovinglby;
+											pResolverData[pEntity->GetIndex()].addyaw > 0.f ? pAngles->y = g_BacktrackHelper->PlayerRecord[i].LowerBodyYawTarget - pResolverData[pEntity->GetIndex()].addyaw : pAngles->y = g_BacktrackHelper->PlayerRecord[i].LowerBodyYawTarget - 17.5;
+										}
+
+										G::FakeDetection[i] = 1;
+										if (pResolverData[pEntity->GetIndex()].oldlby != pResolverData[pEntity->GetIndex()].lastmovinglby)
+											pAngles->y = pResolverData[pEntity->GetIndex()].lastmovinglby;
+										else
+											pAngles->y = g_BacktrackHelper->PlayerRecord[i].LowerBodyYawTarget - 180.f;
+									}
+									else if (c_m_flWeight == 0.f && (p_m_flCycle > 0.92f && c_m_flCycle > 0.92f)) // breaking lby with delta < 120; can fakewalk here aswell
+									{
+										G::FakeDetection[i] = 1;
+										if (pResolverData[pEntity->GetIndex()].oldlby != pResolverData[pEntity->GetIndex()].lastmovinglby)
+											pAngles->y = pResolverData[pEntity->GetIndex()].lastmovinglby;
+										else
+											pAngles->y = g_BacktrackHelper->PlayerRecord[i].LowerBodyYawTarget - 180.f;
+									}
+								}
+							}
+							/*другая ресольва  ака брут :thinking:*/
+							else {
+
+								G::FakeDetection[i] = 2;
+								pAngles->y = pResolverData[pEntity->GetIndex()].lastmovinglby;
+								pResolverData[pEntity->GetIndex()].addyaw > 0.f ? pAngles->y = g_BacktrackHelper->PlayerRecord[i].LowerBodyYawTarget - pResolverData[pEntity->GetIndex()].addyaw : pAngles->y = g_BacktrackHelper->PlayerRecord[i].LowerBodyYawTarget - 17.5;
+							}
+						}
+					}
+					else
+					{
+						g_BacktrackHelper->PlayerRecord[i].records.clear();
+					}
+				}
+			}
+		}
+
+		g_BacktrackHelper->AnimationFix(curStage);
+
+		if (curStage == FRAME_RENDER_START) {
+			for (int i = 1; i < g_pGlobals->maxClients; i++) {
+				CBaseEntity* pEntity = g_pEntitylist->GetClientEntity(i);
+				if (pEntity) {
+					if (pEntity->GetHealth() > 0 && !pEntity->IsDormant()) {
+
+						g_BacktrackHelper->UpdateBacktrackRecords(pEntity);
+						g_BacktrackHelper->UpdateExtrapolationRecords(pEntity);
+					}
+				}
+			}
+		}
+
+		clientVMT->GetOriginalMethod<FrameStageNotifyFn>(37)(curStage);
+
+		if (curStage == FRAME_RENDER_START && G::LocalPlayer && G::LocalPlayer->GetHealth() > 0) {
+			if (Clientvariables->Visuals.Novisrevoil) {
+				*aim_punch = oldAimPunch;
+				*view_punch = oldViewPunch;
+			}
+		}
+	}
+}
