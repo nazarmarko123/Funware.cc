@@ -1,3 +1,0 @@
-# HOPPODOOGOGO
-
-MINEkREft HeEK
